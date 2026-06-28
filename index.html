@@ -1854,23 +1854,30 @@ function getProductItem(code) {
 }
 
 // 특정 배치의 분쇄기록 존재 여부
-function hasGrindRecord(batchNum, batchCode) {
-  // ★ _calcGrindedKg 재사용 — roastDate 기준 매칭으로 통일
+function hasGrindRecord(batchNum, batchCode, batchInDateHint) {
+  // ★ _calcGrindedKg 재사용 — date(입고일) 기준 매칭으로 통일
   if (typeof _calcGrindedKg === 'function') {
-    return _calcGrindedKg(batchNum, batchCode) > 0;
+    return _calcGrindedKg(batchNum, batchCode, batchInDateHint) > 0;
   }
   return false;
 }
 // ★ 특정 계획건(planId, useKg)에 대해 분쇄 완료 여부 판별
 // 동일 배치가 여러 계획에 나뉜 경우: 오래된 계획부터 분쇄량을 순서대로 채워나감
 // → 잔량이 남아있어도 이전 계획에 배정된 분쇄량이 먼저 채워져야 이 계획이 완료됨
-function _isGrindDoneForPlan(batchNum, batchCode, planId, useKg) {
+function _isGrindDoneForPlan(batchNum, batchCode, planId, useKg, batchInDateHint) {
   if (!(useKg > 0)) return false;
 
   // 이 배치와 연관된 모든 계획건을 오래된 순 정렬
-  // ★ _planBelongsToBatch: 배치번호 재사용 시에도 현재 배치의 계획만 정확히 필터링
-  const rawBatch = BATCHES.find(function(b) { return b.batch === batchNum && b.code === batchCode; });
-  const _roastDate = rawBatch ? (rawBatch.roastDate || rawBatch.date || '') : '';
+  // ★ _planBelongsToBatch: roastDate 기준 / _calcGrindedKg: date(입고일) 기준 — 분리 사용
+  // ★ 배치번호+code 1차 매칭 → done=null 우선 → batchInDateHint는 복수일 때 보조
+  const _rdCandidates = BATCHES.filter(function(b) { return b.batch === batchNum && b.code === batchCode; });
+  const _rdActive = _rdCandidates.filter(function(b) { return !b.done; });
+  const _rdPool = _rdActive.length > 0 ? _rdActive : _rdCandidates;
+  const rawBatch = (batchInDateHint && _rdPool.length > 1)
+    ? (_rdPool.find(function(b) { return (b.date || b.roastDate) === batchInDateHint; }) || _rdPool[0])
+    : _rdPool[0] || null;
+  const _roastDate  = rawBatch ? (rawBatch.roastDate || rawBatch.date || '') : '';  // planBelongs용
+  const _batchInDate = rawBatch ? (rawBatch.date || rawBatch.roastDate || '') : ''; // calcGrinded용
   const allPlans = [];
   PLAN_HISTORY.forEach(function(ph) {
     (ph.batches || []).forEach(function(pb) {
@@ -1883,7 +1890,7 @@ function _isGrindDoneForPlan(batchNum, batchCode, planId, useKg) {
   allPlans.sort(function(a, b) { return a.id - b.id; });
 
   // 배치 전체 분쇄량 합산
-  const totalGrinded = _calcGrindedKg(batchNum, batchCode);
+  const totalGrinded = _calcGrindedKg(batchNum, batchCode, _batchInDate);
 
   // 오래된 계획부터 분쇄량을 순서대로 차감
   let remaining = totalGrinded;
@@ -2005,7 +2012,7 @@ function enrichBatch(b) {
   // (planKgTotal은 위에서 이미 계산됨)
 
   // ★ _calcGrindedKg 재사용 — roastDate 기준 매칭으로 통일 (중복 코드 제거)
-  const actualGrindedKg = (typeof _calcGrindedKg === 'function') ? _calcGrindedKg(b.batch, b.code) : 0;
+  const actualGrindedKg = (typeof _calcGrindedKg === 'function') ? _calcGrindedKg(b.batch, b.code, b.date||b.roastDate||'') : 0;
   const grindableKg = Math.max(0, Math.round((planKgTotal - actualGrindedKg) * 100) / 100);
   return {...b, item, grind, prod, dead, qty, mins, remainWeight, grindableKg};
 }
@@ -3108,7 +3115,7 @@ function renderPlanTodaySummary() {
     const hasGrind = batches.some(function(b) {
       const _r = BATCHES.find(x => x.batch === b.batch && x.code === b.code);
       const _done = _r && _isPlanBatchDone(_r, b._planId || b._planId, b.useKg);
-      return _isGrindDoneForPlan(b.batch, b.code, b._planId, b.useKg) && !_done;
+      return _isGrindDoneForPlan(b.batch, b.code, b._planId, b.useKg, b.date||b.roastDate) && !_done;
     });
     const hdrCancel = hasGrind
       ? '<span style="font-size:11px;color:var(--yellow);background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.3);border-radius:5px;padding:2px 8px;">분쇄완료</span>'
@@ -3122,7 +3129,7 @@ function renderPlanTodaySummary() {
       batches.forEach(function(b, bi) {
         const raw       = BATCHES.find(x => x.batch === b.batch && x.code === b.code);
         // ★ grindDone: 단순 분쇄기록 존재가 아닌, 이 계획건 배정량(useKg) 기준 완전 분쇄 여부
-        const grindDone = _isGrindDoneForPlan(b.batch, b.code, b._planId, b.useKg);
+        const grindDone = _isGrindDoneForPlan(b.batch, b.code, b._planId, b.useKg, b.date||b.roastDate);
         const isActive  = raw && (raw.reserved || (raw.usedKg||0) > 0);
         const isDone    = raw && _isPlanBatchDone(raw, b._planId, b.useKg);
         const machCode  = b.machine || (raw ? raw.machine : '') || '';
@@ -3247,7 +3254,7 @@ function renderPlanHistory() {
     const totalKg   = Math.round(batches.reduce(function(a, b) { return a + (parseFloat(b.useKg) || 0); }, 0) * 100) / 100;
     const prodDate  = (h.prodDate || h.date || '').substring(0, 10);
     const confDate  = (h.date     || '').substring(0, 10);
-    const hasGrind  = batches.some(function(b) { return _isGrindDoneForPlan(b.batch, b.code, h.id, b.useKg); });
+    const hasGrind  = batches.some(function(b) { return _isGrindDoneForPlan(b.batch, b.code, h.id, b.useKg, b.date||b.roastDate); });
     const hdrRight = hasGrind
       ? '<span style="display:flex;align-items:center;gap:6px;">'
         + '<span style="font-size:11px;color:var(--yellow);">일부 분쇄중</span>'
@@ -3278,7 +3285,7 @@ function renderPlanHistory() {
           const raw       = BATCHES.find(function(x) { return x.batch === b.batch && x.code === b.code; });
           const isActive  = raw && (raw.reserved || (raw.usedKg||0) > 0);
           // ★ grindDone: 이 계획건 배정량(useKg) 기준 완전 분쇄 여부
-          const grindDone = _isGrindDoneForPlan(b.batch, b.code, h.id, b.useKg);
+          const grindDone = _isGrindDoneForPlan(b.batch, b.code, h.id, b.useKg, b.date||b.roastDate);
           const machCode  = b.machine || (raw ? raw.machine : '') || '';
           const machCell  = machCode
             ? '<span style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--purple);background:rgba(167,139,250,.12);border:1px solid rgba(167,139,250,.25);border-radius:3px;padding:1px 5px;">' + machCode + '</span>'
@@ -3547,7 +3554,7 @@ async function deleteAllPlanByDate() {
   }
   // 분쇄된 배치가 포함된 계획 체크
   const grindedItems = targets.flatMap(h =>
-    h.batches.filter(b => hasGrindRecord(b.batch, b.code)).map(b => b.batch)
+    h.batches.filter(b => hasGrindRecord(b.batch, b.code, b.date||b.roastDate)).map(b => b.batch)
   );
   if (grindedItems.length) {
     alert('이미 분쇄된 배치(' + [...new Set(grindedItems)].join(', ') + ')가 포함되어 있어\n전체 삭제할 수 없습니다.\n분쇄 기록을 먼저 삭제해주세요.');
@@ -4870,7 +4877,7 @@ function populateProdItemSelect() {
   const validCodes = new Set(
     BATCHES.filter(b => {
       if (b.done) return false;
-      const grindedKg = _calcGrindedKg(b.batch, b.code);
+      const grindedKg = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
       const prodUsed  = b.prodUsedKg || 0;
       return Math.max(0, Math.round((grindedKg - prodUsed)*100)/100) > 0;
     }).map(b => b.code)
@@ -4928,24 +4935,25 @@ function _planBelongsToBatch(pb, planHistory, batchNum, batchCode, batchRoastDat
 
 // GRIND_RECORDS 기반으로 특정 배치의 실제 분쇄량 합산
 // ★ 배치번호는 항상 4자리 패딩으로 통일 — DB/저장 모두 동일 형식
-function _calcGrindedKg(batchNum, batchCode) {
+function _calcGrindedKg(batchNum, batchCode, batchInDateHint) {
   let total = 0;
   // 배치번호 정규화 (4자리/8자리 혼용 호환)
   const batchKey = _normBatch(batchNum);
   const ck = batchCode + '||' + batchKey;
 
-  // ★ [근본해결] 같은 batch번호+code가 여러 개일 때(번호 재사용)
-  //   done=null인 배치 중 date가 가장 최신인 것을 우선 선택 → 이전 배치 분쇄 기록 오염 방지
+  // ★ [근본해결] batchKgs/batchDates 키에 배치번호가 포함되어 있으므로
+  //   rawB는 구버전 폴백(batchDates 없는 기록)용으로만 사용
+  //   배치번호+code 1차 매칭 → done=null 우선 → 최신 date 순
   const _candidates = BATCHES.filter(function(b) {
     return b.code === batchCode && (b.batch === batchNum || _normBatch(b.batch) === batchKey);
   });
   const _activeCandidates = _candidates.filter(function(b) { return !b.done; });
   const _pickFrom = _activeCandidates.length > 0 ? _activeCandidates : _candidates;
   const rawB = _pickFrom.slice().sort(function(a, b) {
-    return (b.date || '') > (a.date || '') ? 1 : -1;  // date 내림차순 → 최신 우선
+    return (b.date || '') > (a.date || '') ? 1 : -1;
   })[0] || null;
   const roastDate   = rawB ? (rawB.roastDate || rawB.date || null) : null;
-  const batchInDate = rawB ? (rawB.date || rawB.roastDate || null) : null;  // ★ 실제 입고일
+  const batchInDate = rawB ? (rawB.date || rawB.roastDate || null) : null;
 
   GRIND_RECORDS.forEach(function(r) {
     if (!r.batches || r.batches.length === 0) return;
@@ -4954,9 +4962,13 @@ function _calcGrindedKg(batchNum, batchCode) {
       return _normBatch(bn) === batchKey;
     });
     if (!batchMatch) return;
-    // ★ [근본해결] batchDates가 있으면 입고일로 정확히 매칭 — 배치번호 재사용 완벽 구분
+    // ★ [핵심] batchKgs 키가 'code||batchNum' 형식 → 배치번호 자체가 구분자
+    //   batchDates가 있으면 입고일도 추가 검증 (배치번호 재사용 완벽 구분)
     if (r.batchDates && r.batchDates[ck] != null) {
-      if (r.batchDates[ck] !== batchInDate) return;  // 입고일 다르면 다른 배치 → 스킵
+      // batchDates[ck] 값이 현재 배치의 입고일과 다르면 다른 배치 → 스킵
+      // batchInDateHint(호출부에서 전달된 date)가 있으면 그것으로 비교, 없으면 rawB.date로 비교
+      const expectedDate = batchInDateHint || batchInDate;
+      if (expectedDate && r.batchDates[ck] !== expectedDate) return;
     } else {
       // batchDates 없는 구기록: 입고일/로스팅일 기준 필터링으로 폴백
       if (batchInDate && r.date && r.date < batchInDate) return;
@@ -4978,7 +4990,7 @@ function renderProdBatchPicker() {
   const allValid = BATCHES.filter(b => {
     if (b.done) return false;
     if (code && b.code !== code) return false;
-    const grindedKg = _calcGrindedKg(b.batch, b.code);
+    const grindedKg = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
     const prodUsed  = b.prodUsedKg || 0;
     return Math.max(0, Math.round((grindedKg - prodUsed)*100)/100) > 0;
   }).sort((a,b) => (a.roastDate||a.date||'').localeCompare(b.roastDate||b.date||'') || _batchSort(a.batch,b.batch));
@@ -4989,7 +5001,7 @@ function renderProdBatchPicker() {
   }
 
   const totalProdKg = Math.round(allValid.reduce((s,b) => {
-    const g = _calcGrindedKg(b.batch, b.code);
+    const g = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
     return s + Math.max(0, g - (b.prodUsedKg||0));
   }, 0)*100)/100;
 
@@ -5007,11 +5019,9 @@ function renderProdBatchPicker() {
     const _pk       = b.code+"||"+b.batch;
     const checked   = !!_prodBatchInputs[_pk];
     const kg        = checked ? (_prodBatchInputs[_pk] || '') : '';
-    const grindedKg = _calcGrindedKg(b.batch, b.code);
+    const grindedKg = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
     const prodAvail = Math.max(0, Math.round((grindedKg - (b.prodUsedKg||0))*100)/100);
     const item      = getItem(b.code);
-
-    // 분쇄일 조회 — 4자리 패딩 기준
     const _bKey = _normBatch(b.batch);
     const grindRec = GRIND_RECORDS.find(r => {
       if (!r.batches) return false;
@@ -5060,7 +5070,7 @@ function toggleBatch(batchId, batchCode) {
 
   if (chk.checked) {
     const rawB = BATCHES.find(b => b.batch === batchId && (!batchCode || b.code === batchCode));
-    const grindedKg = rawB ? _calcGrindedKg(batchId, batchCode) : 0;
+    const grindedKg = rawB ? _calcGrindedKg(batchId, batchCode, rawB.date||rawB.roastDate) : 0;
     const prodAvail = rawB ? Math.max(0, Math.round((grindedKg - (rawB.prodUsedKg||0))*100)/100) : 0;
     const defaultKg = prodAvail > 0 ? prodAvail : 0;
     kgEl.disabled = false;
@@ -5449,7 +5459,7 @@ async function deleteProdRecord(id) {
         }
         // done 해제 후 분쇄 잔량 있으면 reserved 유지
         if (!rawB.done) {
-          const grindedKg  = _calcGrindedKg(rawB.batch, rawB.code);
+          const grindedKg  = _calcGrindedKg(rawB.batch, rawB.code, rawB.date||rawB.roastDate);
           const remainProd = Math.max(0, Math.round((grindedKg - rawB.prodUsedKg) * 100) / 100);
           if (remainProd > 0) rawB.reserved = true;
         }
@@ -5463,7 +5473,7 @@ async function deleteProdRecord(id) {
       }
 
       if (confirmedKg > 0 && !rawB.reserved) {
-        const grindedKg  = _calcGrindedKg(rawB.batch, rawB.code);
+        const grindedKg  = _calcGrindedKg(rawB.batch, rawB.code, rawB.date||rawB.roastDate);
         const remainProd = Math.max(0, Math.round((grindedKg - rawB.prodUsedKg) * 100) / 100);
         if (remainProd > 0) rawB.reserved = true;
       }
@@ -5689,11 +5699,11 @@ function renderGrindTodayPlan() {
       const planKey = h.id + '_' + (b.code||'') + '_' + b.batch;
 
       // 분쇄기록에서 이 배치의 전체 분쇄량 합산 (_calcGrindedKg 재사용)
-      const totalGrinded = _calcGrindedKg(b.batch, b.code);
+      const totalGrinded = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
 
       // 이 계획건의 완료 여부: 계획별로 분쇄량을 안분하여 판별
       // (배치 전체 분쇄량이 아닌, 이 계획건에 배정된 useKg 기준)
-      const isDone = _isGrindDoneForPlan(b.batch, b.code, h.id, planKg);
+      const isDone = _isGrindDoneForPlan(b.batch, b.code, h.id, planKg, b.roastDate);
       const grindDate = isDone
         ? (GRIND_RECORDS.find(r => r.batches && r.batches.indexOf(b.batch) !== -1) || {}).date || null
         : null;
@@ -5869,7 +5879,7 @@ function printPlanSummary() {
       const isDone = raw && _isPlanBatchDone(raw, h.id, b.useKg);
 
       // ★ grind: 단순 분쇄기록 존재가 아닌, 이 계획건 배정량(useKg) 기준 완전 분쇄 여부
-      const grind  = _isGrindDoneForPlan(b.batch, b.code, h.id, b.useKg);
+      const grind  = _isGrindDoneForPlan(b.batch, b.code, h.id, b.useKg, b.date||b.roastDate);
       const mach   = b.machine || (raw ? raw.machine : '') || '';
       // reserved=false여도 usedKg>0이면 계획이 살아있는 것 (생산완료 후 해제됨)
       const _hasUsedKg = raw && (raw.usedKg||0) > 0;
@@ -6848,7 +6858,7 @@ async function deleteGrindRecord(id, targetCode) {
     // ★ 남은 GRIND_RECORDS에서 이 배치의 실제 분쇄량 합산
     // _calcGrindedKg와 동일하게 roastDate 기준으로 재계산
     const realGrinded = (typeof _calcGrindedKg === 'function')
-      ? _calcGrindedKg(rawB.batch, rawB.code)
+      ? _calcGrindedKg(rawB.batch, rawB.code, rawB.date||rawB.roastDate)
       : 0;
     rawB.grindUsedKg = realGrinded;
 
@@ -7814,12 +7824,12 @@ function toggleGrindSelectAll(checked) {
 function toggleProdGroupSelect(code, checked) {
   const groupBatches = BATCHES.filter(b => {
     if (b.done || b.code !== code) return false;
-    const grindedKg = _calcGrindedKg(b.batch, b.code);
+    const grindedKg = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
     const prodAvail = Math.max(0, Math.round((grindedKg - (b.prodUsedKg||0)) * 100) / 100);
     return prodAvail > 0;
   });
   groupBatches.forEach(b => {
-    const grindedKg = _calcGrindedKg(b.batch, b.code);
+    const grindedKg = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
     const prodAvail = Math.max(0, Math.round((grindedKg - (b.prodUsedKg||0)) * 100) / 100);
     if (checked) {
       _prodBatchInputs[b.code+"||"+b.batch] = prodAvail;
@@ -7841,12 +7851,12 @@ function toggleProdSelectAll(checked) {
   const allValid = BATCHES.filter(b => {
     if (b.done) return false;
     if (code && b.code !== code) return false;
-    const grindedKg = _calcGrindedKg(b.batch, b.code);
+    const grindedKg = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
     const prodAvail = Math.max(0, Math.round((grindedKg - (b.prodUsedKg||0)) * 100) / 100);
     return prodAvail > 0;
   });
   allValid.forEach(b => {
-    const grindedKg = _calcGrindedKg(b.batch, b.code);
+    const grindedKg = _calcGrindedKg(b.batch, b.code, b.date||b.roastDate);
     const prodAvail = Math.max(0, Math.round((grindedKg - (b.prodUsedKg||0)) * 100) / 100);
     if (checked) {
       _prodBatchInputs[b.code+"||"+b.batch] = prodAvail;
