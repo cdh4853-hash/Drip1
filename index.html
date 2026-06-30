@@ -1735,6 +1735,19 @@ async function dbSaveProdRecord(r) {
   });
   if (error) throw error;
 }
+async function dbUpdateProdRecord(r) {
+  const lossRate = (r.actualQty>0 && r.expectedQty>0)
+    ? Math.round(((r.expectedQty - r.actualQty) / r.expectedQty)*1000)/10 : null;
+  const { error } = await sb.from('drip1_prod_records').update({
+    date:r.date, code:r.code, item_name:r.itemName, batch:r.batch,
+    qty:r.actualQty||r.qty, input_g:r.inputG||0, worker:r.worker||'—', batch_inputs:r.batchInputs||{},
+    product_code:r.productCode||r.code, product_name:r.productName||r.itemName,
+    gram_per_unit:r.gramPerUnit||null, expected_qty:r.expectedQty||null,
+    actual_qty:r.actualQty||r.qty, loss_rate:lossRate,
+    mins: r.mins||null, prod_kpm: r.prodKpm||null, prod_kph: r.prodKph||null
+  }).eq('id', r.id);
+  if (error) throw error;
+}
 async function dbDeleteProdRecord(id) {
   // ★ [수정] 소프트 삭제 제거 → 즉시 완전 삭제
   const { error } = await sb.from('drip1_prod_records').delete().eq('id', id);
@@ -2110,6 +2123,22 @@ function setDashPeriod(p) {
   renderDashboard();
 }
 function renderDashboard() {
+  // ★ [공통화] 생산기록 1건의 예상수량/로스율을 항상 동일한 공식으로 계산
+  //   (생산 기록 테이블과 100% 동일한 결과가 나오도록 통일 — 로스율 카드/모달도 이 값을 그대로 사용)
+  function _recExpectedQty(r) {
+    if (r.expectedQty != null) return r.expectedQty;
+    const gram = r.gramPerUnit || getProduct(r.productCode)?.gramPerUnit || getItem(r.code)?.gramPerUnit || 0;
+    return (gram>0 && r.inputG>0) ? Math.floor(r.inputG/gram) : null;
+  }
+  function _recLossRate(r) {
+    if (r.lossRate != null) return r.lossRate;
+    const exp = _recExpectedQty(r);
+    const act = r.actualQty || r.qty;
+    return (exp>0 && act>0) ? Math.round(((exp-act)/exp)*1000)/10 : null;
+  }
+  window._recExpectedQty = _recExpectedQty;
+  window._recLossRate = _recLossRate;
+
   const groups  = getScheduleGroups();
   const reserved = BATCHES.filter(b=>b.reserved);
   const urgent  = groups.filter(s=>dday(s.dead)<=3);
@@ -2127,8 +2156,9 @@ function renderDashboard() {
   else if (_dbPeriod==='month') { const ym=_td.substring(0,7); _filtProd=PROD_RECORDS.filter(r=>r.date.startsWith(ym)); }
   const _sumProdQty = _filtProd.reduce((a,r)=>a+r.qty,0);
   const _sumInputG  = _filtProd.reduce((a,r)=>a+(r.inputG||0),0);
-  const _sumTheory  = _filtProd.reduce((a,r)=>{const gram=getProduct(r.productCode)?.gramPerUnit||getItem(r.code)?.gramPerUnit||0;return a+(gram>0?r.qty*gram:0);},0);
-  const _lossRate   = (_sumInputG>0&&_sumTheory>0) ? Math.round((_sumInputG-_sumTheory)/_sumInputG*1000)/10 : null;
+  const _sumExpected = _filtProd.reduce((a,r)=>a+(_recExpectedQty(r)||0),0);
+  const _sumActual    = _filtProd.reduce((a,r)=>a+(r.actualQty||r.qty||0),0);
+  const _lossRate   = (_sumExpected>0) ? Math.round((_sumExpected-_sumActual)/_sumExpected*1000)/10 : null;
   const _lossColor  = _lossRate===null?'var(--text2)':_lossRate<3?'var(--green)':_lossRate<6?'var(--yellow)':'var(--red)';
   const periodLabel = _dbPeriod==='today'?'오늘':_dbPeriod==='month'?'이번달':'올해';
   const pLabel = document.getElementById('db-period-label');
@@ -2176,32 +2206,38 @@ function renderDashboard() {
         <td class="mono">${ddayLabel(dd)}</td><td>${statusBadge(dd)}</td>
       </tr>`;}).join('');
 
-  // 제품별 로스율 카드
+  // 제품별 로스율 카드 (기간: 전체/연도별/월별, 클릭 시 상세 생산내역)
+  const _lossRecords = _filterLossRecords(PROD_RECORDS);
   const _lossMap = {};
-  PROD_RECORDS.forEach(r=>{
-    if(!_lossMap[r.code]) _lossMap[r.code]={name:r.itemName,inputG:0,theoryG:0,qty:0,cnt:0};
-    const mms=getProduct(r.productCode)?.gramPerUnit||getItem(r.code)?.gramPerUnit||0;
-    _lossMap[r.code].inputG+=r.inputG||0;
-    _lossMap[r.code].theoryG+=mms>0?r.qty*mms:0;
-    _lossMap[r.code].qty+=r.qty; _lossMap[r.code].cnt++;
+  _lossRecords.forEach(r=>{
+    if(!_lossMap[r.code]) _lossMap[r.code]={code:r.code,name:r.itemName,expSum:0,actSum:0,inputG:0,qty:0,cnt:0};
+    const exp = _recExpectedQty(r);
+    if (exp != null) _lossMap[r.code].expSum += exp;
+    _lossMap[r.code].actSum += (r.actualQty||r.qty||0);
+    _lossMap[r.code].inputG += r.inputG||0;
+    _lossMap[r.code].qty += r.qty; _lossMap[r.code].cnt++;
   });
   const _lossVals = Object.values(_lossMap).filter(x=>x.inputG>0);
   const statEl = document.getElementById('dash-prod-stats');
   if (statEl) {
+    const _periodCtrl = _buildLossPeriodControl();
     if (!_lossVals.length) {
-      statEl.innerHTML='';
+      statEl.innerHTML='<div class="section-header" style="margin-bottom:10px;"><span class="section-title">제품별 로스율</span></div>'
+        + _periodCtrl
+        + '<div style="color:var(--text2);font-size:12px;padding:4px 2px 8px;">해당 기간 생산 기록이 없습니다.</div>';
     } else {
-      statEl.innerHTML='<div class="section-header" style="margin-bottom:10px;"><span class="section-title">제품별 로스율 (전체 기간)</span></div>'
+      statEl.innerHTML='<div class="section-header" style="margin-bottom:10px;"><span class="section-title">제품별 로스율</span></div>'
+        + _periodCtrl
         +'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;">'
         +_lossVals.map(it=>{
-          const lr=Math.round((it.inputG-it.theoryG)/it.inputG*1000)/10;
-          const lc=lr<3?'var(--green)':lr<6?'var(--yellow)':'var(--red)';
+          const lr = it.expSum>0 ? Math.round((it.expSum-it.actSum)/it.expSum*1000)/10 : null;
+          const lc = lr===null ? 'var(--text2)' : lr<3?'var(--green)':lr<6?'var(--yellow)':'var(--red)';
           const iObj=Object.values(Object.fromEntries(ITEMS.map(x=>[x.name,x]))).find(x=>x.name===it.name);
           const iColor=iObj?.color||'var(--accent)';
-          return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px;border-left:3px solid ${iColor};">
+          return `<div onclick="openLossDetail('${it.code}')" title="${lr===null?'제품마스터에 1개당 그램(g)이 설정되지 않아 로스율을 계산할 수 없습니다':'클릭하면 생산내역을 볼 수 있어요'}" style="cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px;border-left:3px solid ${iColor};transition:background .15s;" onmouseover="this.style.background='var(--surface2)'" onmouseout="this.style.background='var(--surface)'">
             <div style="font-size:clamp(10px,1.1vw,11px);color:var(--text2);margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${it.name}</div>
-            <div style="font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:${lc};">${lr}%</div>
-            <div style="font-size:11px;color:var(--text2);margin-top:3px;">${it.cnt}회 · ${it.qty.toLocaleString()}개</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:${lc};">${lr!==null?lr+'%':'—'}</div>
+            <div style="font-size:11px;color:var(--text2);margin-top:3px;">${it.cnt}회 · ${it.qty.toLocaleString()}개 · 보기 →${lr===null?' · g값 확인필요':''}</div>
           </div>`;
         }).join('')+'</div>';
     }
@@ -2224,6 +2260,102 @@ function renderDashboard() {
       <td class="mono">${s.totalQty.toLocaleString()}</td>
       <td class="mono">${ddayLabel(dd)}</td><td>${statusBadge(dd)}</td>
     </tr>`;}).join('');
+}
+
+// ---- 제품별 로스율 기간 필터 (월별/연도별/기간) ----
+let _lossPeriodMode = 'month';   // 'month' | 'year' | 'range'
+let _lossYearVal   = today().substring(0,4);
+let _lossMonthVal  = today().substring(0,7);
+let _lossRangeFrom = today().substring(0,8) + '01';
+let _lossRangeTo   = today();
+
+function _filterLossRecords(records) {
+  if (_lossPeriodMode === 'year')  return records.filter(r=>r.date && r.date.startsWith(_lossYearVal));
+  if (_lossPeriodMode === 'month') return records.filter(r=>r.date && r.date.startsWith(_lossMonthVal));
+  if (_lossPeriodMode === 'range') return records.filter(r=>r.date && r.date>=_lossRangeFrom && r.date<=_lossRangeTo);
+  return records;
+}
+
+function _buildLossPeriodControl() {
+  const years = [...new Set(PROD_RECORDS.map(r=>(r.date||'').substring(0,4)).filter(Boolean))].sort().reverse();
+  if (!years.includes(_lossYearVal)) years.unshift(_lossYearVal);
+  const yearOpts = years.map(y=>`<option value="${y}" ${y===_lossYearVal?'selected':''}>${y}년</option>`).join('');
+  const btn = (mode,label) => `<button class="btn btn-ghost btn-sm" style="${_lossPeriodMode===mode?'border-color:var(--accent);color:var(--accent);background:rgba(200,169,110,.15);':''}" onclick="setLossPeriodMode('${mode}')">${label}</button>`;
+  const inputCss = "background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:12px;font-family:'JetBrains Mono',monospace;outline:none;";
+  let extra = '';
+  if (_lossPeriodMode === 'year') {
+    extra = `<select onchange="onLossYearChange(this.value)" style="${inputCss}margin-left:6px;">${yearOpts}</select>`;
+  } else if (_lossPeriodMode === 'month') {
+    extra = `<input type="month" value="${_lossMonthVal}" onchange="onLossMonthChange(this.value)" style="${inputCss}margin-left:6px;">`;
+  } else if (_lossPeriodMode === 'range') {
+    extra = `<input type="date" value="${_lossRangeFrom}" onchange="onLossRangeChange(this.value,null)" style="${inputCss}margin-left:6px;">`
+      + `<span style="color:var(--text2);font-size:12px;">~</span>`
+      + `<input type="date" value="${_lossRangeTo}" onchange="onLossRangeChange(null,this.value)" style="${inputCss}">`;
+  }
+  return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:12px;flex-wrap:wrap;">${btn('month','월별')}${btn('year','연도별')}${btn('range','기간')}${extra}</div>`;
+}
+
+function setLossPeriodMode(mode) { _lossPeriodMode = mode; renderDashboard(); }
+function onLossYearChange(v)  { _lossYearVal  = v; renderDashboard(); }
+function onLossMonthChange(v) { _lossMonthVal = v; renderDashboard(); }
+function onLossRangeChange(from, to) {
+  if (from!==null) _lossRangeFrom = from;
+  if (to!==null)   _lossRangeTo   = to;
+  renderDashboard();
+}
+
+// ---- 로스율 카드 클릭 → 해당 제품 생산내역 상세 모달 ----
+function openLossDetail(code) {
+  const records = _filterLossRecords(PROD_RECORDS).filter(r=>r.code===code).slice().sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+  const item = getItem(code);
+  const name = records[0]?.itemName || item?.name || code;
+  const periodLabel = _lossPeriodMode==='year' ? _lossYearVal+'년'
+    : _lossPeriodMode==='range' ? (fmt(_lossRangeFrom)+' ~ '+fmt(_lossRangeTo))
+    : _lossMonthVal;
+
+  let totalExp=0, totalAct=0, totalQty=0;
+  const _expFn = window._recExpectedQty || function(){return null;};
+  const rows = records.map(r=>{
+    const exp = _expFn(r);
+    const act = r.actualQty || r.qty;
+    const lr = r.lossRate != null ? r.lossRate : (exp>0 && act>0 ? Math.round(((exp-act)/exp)*1000)/10 : null);
+    totalExp += exp||0; totalAct += act||0; totalQty += r.qty;
+    const lc = lr===null?'var(--text2)':lr<3?'var(--green)':lr<6?'var(--yellow)':'var(--red)';
+    return `<tr>
+      <td class="mono">${fmt(r.date)}</td>
+      <td class="mono">${r.batch||'—'}</td>
+      <td class="mono">${((r.inputG||0)/1000).toFixed(2)}kg</td>
+      <td class="mono">${(r.qty||0).toLocaleString()}개</td>
+      <td class="mono">${r.worker||'—'}</td>
+      <td class="mono" style="color:${lc};font-weight:600;">${lr!==null?lr+'%':'—'}</td>
+    </tr>`;
+  }).join('');
+  const totalLr = (totalExp>0) ? Math.round((totalExp-totalAct)/totalExp*1000)/10 : null;
+  const totalLc = totalLr===null?'var(--text2)':totalLr<3?'var(--green)':totalLr<6?'var(--yellow)':'var(--red)';
+
+  const html = `
+  <div id="loss-detail-overlay" onclick="if(event.target===this)closeLossDetail()" style="position:fixed;inset:0;background:rgba(15,17,23,.75);z-index:9997;display:flex;align-items:center;justify-content:center;padding:24px;">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;width:100%;max-width:800px;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);">
+        <div>
+          <div style="font-size:15px;font-weight:700;">${name}</div>
+          <div style="font-size:11px;color:var(--text2);margin-top:2px;">${periodLabel} · 로스율 ${totalLr!==null?`<span style="color:${totalLc};font-weight:700;">${totalLr}%</span>`:'—'} · ${records.length}건 · ${totalQty.toLocaleString()}개</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="closeLossDetail()">닫기</button>
+      </div>
+      <div class="overflow-x" style="overflow-y:auto;flex:1;">
+        <table><thead><tr>
+          <th>생산일</th><th>배치</th><th>투입</th><th>수량</th><th>작업자</th><th>로스율</th>
+        </tr></thead><tbody>${rows || '<tr><td colspan="6" class="empty">기록이 없습니다.</td></tr>'}</tbody></table>
+      </div>
+    </div>
+  </div>`;
+  closeLossDetail();
+  document.body.insertAdjacentHTML('beforeend', html);
+}
+function closeLossDetail() {
+  const el = document.getElementById('loss-detail-overlay');
+  if (el) el.remove();
 }
 
 // ============================================================
@@ -4862,7 +4994,7 @@ function renderTodayProdTable() {
       <td class="mono" style="font-size:11px;color:var(--text2);">${r.mins||'—'}</td>
       <td class="mono" style="font-size:11px;color:var(--purple);">${r.prodKph ? r.prodKph.toLocaleString()+'개/h' : '—'}</td>
       <td style="font-size:12px;">${r.worker}</td>
-      <td><button class="btn btn-danger btn-sm" onclick="deleteProdRecord(${r.id})">삭제</button></td>
+      <td style="display:flex;gap:4px;"><button class="btn btn-ghost btn-sm" onclick="openEditProdRecord(${r.id})">수정</button><button class="btn btn-danger btn-sm" onclick="deleteProdRecord(${r.id})">삭제</button></td>
     </tr>`;
   }).join('');
 
@@ -5226,58 +5358,78 @@ function renderProdProductPicker() {
   calcProdPreview();
 }
 
-async function addProdRecord() {
-  const date       = document.getElementById('p-date').value;
-  let   rawCode    = document.getElementById('p-item').value;
-  const actualQty  = parseInt(document.getElementById('p-qty').value);
-  const inputKg    = parseFloat(document.getElementById('p-inputkg')?.value) || 0;
-  const mins       = parseFloat(document.getElementById('p-mins')?.value) || 0;
-  const worker     = document.getElementById('p-worker').value.trim();
-  const prodCode   = document.getElementById('p-product')?.value || '';
-  // ★ batchIds: 복합키(code||batch)에서 배치번호만 추출
-  const batchIds   = Object.keys(_prodBatchInputs);
-  const batchNums  = batchIds.map(k => k.includes('||') ? k.split('||')[1] : k);
-  const inputG     = Math.round(inputKg * 1000);
-
-  if (!date)             { showNotif('prod-notif','error','생산 일자를 선택해주세요.'); document.getElementById('p-date')?.focus(); return; }
-  if (!prodCode)         { showNotif('prod-notif','error','생산 제품을 선택해주세요.'); return; }
-  if (!actualQty||actualQty<=0) { showNotif('prod-notif','error','실제 생산수량을 입력해주세요.'); return; }
-
-  // ★ [수정3] 원재료코드/이름 결정 — batchIds[0]은 code||batch 복합키이므로 파싱 후 find
-  let rawName = '미지정';
-  if (!rawCode && batchIds.length) {
-    const firstKey = batchIds[0];
-    const [_fc, _fb] = firstKey.includes('||') ? firstKey.split('||') : [null, firstKey];
-    const rawB = BATCHES.find(b => b.batch === _fb && (!_fc || b.code === _fc));
-    if (rawB) rawCode = rawB.code;
+// ★ [공통화] 생산기록 1건이 배치에 미친 영향(투입량 사용분)을 복원
+//    deleteProdRecord / 생산기록 수정 양쪽에서 재사용 — 로직 중복 방지
+function _restoreBatchEffectsForRecord(rec) {
+  // ★ [폴백] batchInputs 없는 구형 레코드: rec.batch + rec.code 기반으로 복원
+  if (!rec.batchInputs || Object.keys(rec.batchInputs).length === 0) {
+    if (rec.batch && rec.code) {
+      const _fallbackKg = parseFloat(rec.inputG || 0) || 0;
+      const _bNumPad = _normBatch(rec.batch);
+      let rawBF = BATCHES.find(b =>
+        _normBatch(b.batch) === _bNumPad && b.code === rec.code && !b.done
+      ) || BATCHES.find(b =>
+        _normBatch(b.batch) === _bNumPad && b.code === rec.code
+      );
+      if (rawBF && _fallbackKg > 0) {
+        rawBF.prodUsedKg = Math.max(0, Math.round(((rawBF.prodUsedKg||0) - _fallbackKg) * 100) / 100);
+        if (rawBF.done && rawBF.prodUsedKg < (rawBF.weight||0) - 0.001) {
+          rawBF.done = null; rawBF.doneKg = null;
+        }
+      }
+    }
+    return;
   }
-  if (rawCode) rawName = getRawMaterial(rawCode)?.name || rawCode;
-  console.log('[addProdRecord] rawCode:', rawCode, '/ rawName:', rawName, '/ batchInputs:', JSON.stringify(_prodBatchInputs));
+  Object.entries(rec.batchInputs).forEach(([batchId, usedKg]) => {
+    const [_bCode, _bNum] = batchId.includes("||") ? batchId.split("||") : [null, batchId];
+    const _bNumPad = _normBatch(_bNum);
+    // ★ 정확한 배치번호(4자리 패딩) + code로 매칭 — parseInt 정규화 제거
+    let rawB = BATCHES.find(b =>
+      _normBatch(b.batch) === _bNumPad &&
+      (!_bCode || b.code === _bCode)
+    );
+    if (!rawB) rawB = BATCHES.find(b => b.batch === _bNum && (!_bCode || b.code === _bCode));
+    if (!rawB) return;
 
-  const prod = getProduct(prodCode);
-  const productName = prod ? prod.name : prodCode;
-  const gramPerUnit = prod ? prod.gramPerUnit : 0;
-  const expectedQty = gramPerUnit > 0 && inputG > 0 ? Math.floor(inputG / gramPerUnit) : null;
-  const lossRate = (actualQty > 0 && expectedQty > 0)
-    ? Math.round(((expectedQty - actualQty) / expectedQty) * 1000) / 10 : null;
-  const batchLabel = batchNums.length ? batchNums.map(bn => '#'+bn).join(', ') : '—';
-  // 생산속도 계산
-  const prodKpm  = (actualQty > 0 && mins > 0) ? Math.round(actualQty / mins * 10) / 10 : null;
-  const prodKph  = (actualQty > 0 && mins > 0) ? Math.round(actualQty / mins * 60) : null;
+    // 1) prodUsedKg 복구 (생산에 사용된 량 되돌리기)
+    rawB.prodUsedKg = Math.max(0, Math.round(((rawB.prodUsedKg||0) - usedKg) * 100) / 100);
 
-  const newProd = {
-    id: Date.now(), date, code: rawCode, itemName: rawName,
-    batch: batchLabel, qty: actualQty, inputG, worker: worker||'—',
-    // ★ [수정5] batchInputs key를 code||batch 복합키 그대로 유지 (배치번호만 잘라내지 않음)
-    batchInputs: { ..._prodBatchInputs },
-    productCode: prodCode, productName, gramPerUnit,
-    expectedQty, actualQty, lossRate,
-    mins: mins || null, prodKpm, prodKph
-  };
-  PROD_RECORDS.unshift(newProd);
+    // 2) done(사용완료) 상태 해제
+    // ★ prodUsedKg < weight 이면 아직 전량 생산 안 됨 → done 무조건 해제
+    if (rawB.done) {
+      const totalWeight = rawB.weight || 0;
+      const afterProdUsed = rawB.prodUsedKg; // 이미 위에서 차감된 값
+      if (afterProdUsed < totalWeight - 0.001) {
+        rawB.done   = null;
+        rawB.doneKg = null;
+      }
+      // done 해제 후 분쇄 잔량 있으면 reserved 유지
+      if (!rawB.done) {
+        const grindedKg  = _calcGrindedKg(rawB.batch, rawB.code, rawB.date||rawB.roastDate);
+        const remainProd = Math.max(0, Math.round((grindedKg - rawB.prodUsedKg) * 100) / 100);
+        if (remainProd > 0) rawB.reserved = true;
+      }
+    }
 
-  // 생산완료 후 배치별 투입량 누적 및 사용완료 처리
-  Object.entries(_prodBatchInputs).forEach(([batchKey, usedKg]) => {
+    // 3) 생산계획 없이 직접 생산 입력한 경우: usedKg도 복구
+    const confirmedKg = rawB.usedKg || 0;
+    if (confirmedKg <= 0) {
+      rawB.usedKg   = Math.max(0, Math.round(((rawB.usedKg||0) - usedKg) * 100) / 100);
+      rawB.reserved = false;
+    }
+
+    if (confirmedKg > 0 && !rawB.reserved) {
+      const grindedKg  = _calcGrindedKg(rawB.batch, rawB.code, rawB.date||rawB.roastDate);
+      const remainProd = Math.max(0, Math.round((grindedKg - rawB.prodUsedKg) * 100) / 100);
+      if (remainProd > 0) rawB.reserved = true;
+    }
+  });
+}
+
+// ★ [공통화] 생산기록 1건의 배치별 투입량을 배치에 적용(누적+완료처리)
+//    addProdRecord / 생산기록 수정 양쪽에서 재사용 — 로직 중복 방지
+function _applyBatchEffectsForRecord(batchInputs, date, prodCode, productName, actualQty) {
+  Object.entries(batchInputs).forEach(([batchKey, usedKg]) => {
     const [_pCode, _pBatch] = batchKey.includes("||") ? batchKey.split("||") : [null, batchKey];
     const _pBatchPad = _normBatch(_pBatch);
     // ★ 정확한 배치번호(4자리 패딩) + code로 매칭 — done 아닌 배치 우선, roastDate 기준
@@ -5344,6 +5496,61 @@ async function addProdRecord() {
       }
     }
   });
+}
+
+async function addProdRecord() {
+  const date       = document.getElementById('p-date').value;
+  let   rawCode    = document.getElementById('p-item').value;
+  const actualQty  = parseInt(document.getElementById('p-qty').value);
+  const inputKg    = parseFloat(document.getElementById('p-inputkg')?.value) || 0;
+  const mins       = parseFloat(document.getElementById('p-mins')?.value) || 0;
+  const worker     = document.getElementById('p-worker').value.trim();
+  const prodCode   = document.getElementById('p-product')?.value || '';
+  // ★ batchIds: 복합키(code||batch)에서 배치번호만 추출
+  const batchIds   = Object.keys(_prodBatchInputs);
+  const batchNums  = batchIds.map(k => k.includes('||') ? k.split('||')[1] : k);
+  const inputG     = Math.round(inputKg * 1000);
+
+  if (!date)             { showNotif('prod-notif','error','생산 일자를 선택해주세요.'); document.getElementById('p-date')?.focus(); return; }
+  if (!prodCode)         { showNotif('prod-notif','error','생산 제품을 선택해주세요.'); return; }
+  if (!actualQty||actualQty<=0) { showNotif('prod-notif','error','실제 생산수량을 입력해주세요.'); return; }
+
+
+  // ★ [수정3] 원재료코드/이름 결정 — batchIds[0]은 code||batch 복합키이므로 파싱 후 find
+  let rawName = '미지정';
+  if (!rawCode && batchIds.length) {
+    const firstKey = batchIds[0];
+    const [_fc, _fb] = firstKey.includes('||') ? firstKey.split('||') : [null, firstKey];
+    const rawB = BATCHES.find(b => b.batch === _fb && (!_fc || b.code === _fc));
+    if (rawB) rawCode = rawB.code;
+  }
+  if (rawCode) rawName = getRawMaterial(rawCode)?.name || rawCode;
+  console.log('[addProdRecord] rawCode:', rawCode, '/ rawName:', rawName, '/ batchInputs:', JSON.stringify(_prodBatchInputs));
+
+  const prod = getProduct(prodCode);
+  const productName = prod ? prod.name : prodCode;
+  const gramPerUnit = prod ? prod.gramPerUnit : 0;
+  const expectedQty = gramPerUnit > 0 && inputG > 0 ? Math.floor(inputG / gramPerUnit) : null;
+  const lossRate = (actualQty > 0 && expectedQty > 0)
+    ? Math.round(((expectedQty - actualQty) / expectedQty) * 1000) / 10 : null;
+  const batchLabel = batchNums.length ? batchNums.map(bn => '#'+bn).join(', ') : '—';
+  // 생산속도 계산
+  const prodKpm  = (actualQty > 0 && mins > 0) ? Math.round(actualQty / mins * 10) / 10 : null;
+  const prodKph  = (actualQty > 0 && mins > 0) ? Math.round(actualQty / mins * 60) : null;
+
+  const newProd = {
+    id: Date.now(), date, code: rawCode, itemName: rawName,
+    batch: batchLabel, qty: actualQty, inputG, worker: worker||'—',
+    // ★ [수정5] batchInputs key를 code||batch 복합키 그대로 유지 (배치번호만 잘라내지 않음)
+    batchInputs: { ..._prodBatchInputs },
+    productCode: prodCode, productName, gramPerUnit,
+    expectedQty, actualQty, lossRate,
+    mins: mins || null, prodKpm, prodKph
+  };
+  PROD_RECORDS.unshift(newProd);
+
+  // 생산완료 후 배치별 투입량 누적 및 사용완료 처리 (공통 헬퍼 사용)
+  _applyBatchEffectsForRecord(_prodBatchInputs, date, prodCode, productName, actualQty);
   try {
     await dbSaveProdRecord(newProd);
     // 변경된 배치들 DB 저장
@@ -5414,71 +5621,8 @@ async function deleteProdRecord(id) {
 
   if (!confirm('이 생산 기록을 삭제할까요?\n연결된 배치의 생산량이 복원됩니다.')) return;
 
-  // ★ [이슈3 수정] 연결된 배치별 복원 (prodUsedKg + done + usedKg 완전 복구)
-  // ★ [폴백] batchInputs 없는 구형 레코드: rec.batch + rec.code 기반으로 복원
-  if (!rec.batchInputs || Object.keys(rec.batchInputs).length === 0) {
-    if (rec.batch && rec.code) {
-      const _fallbackKg = parseFloat(rec.inputG || 0) || 0;
-      const _bNumPad = _normBatch(rec.batch);
-      let rawBF = BATCHES.find(b =>
-        _normBatch(b.batch) === _bNumPad && b.code === rec.code && !b.done
-      ) || BATCHES.find(b =>
-        _normBatch(b.batch) === _bNumPad && b.code === rec.code
-      );
-      if (rawBF && _fallbackKg > 0) {
-        rawBF.prodUsedKg = Math.max(0, Math.round(((rawBF.prodUsedKg||0) - _fallbackKg) * 100) / 100);
-        if (rawBF.done && rawBF.prodUsedKg < (rawBF.weight||0) - 0.001) {
-          rawBF.done = null; rawBF.doneKg = null;
-        }
-      }
-    }
-  }
-  if (rec.batchInputs && Object.keys(rec.batchInputs).length > 0) {
-    Object.entries(rec.batchInputs).forEach(([batchId, usedKg]) => {
-      const [_bCode, _bNum] = batchId.includes("||") ? batchId.split("||") : [null, batchId];
-      const _bNumPad = _normBatch(_bNum);
-      // ★ 정확한 배치번호(4자리 패딩) + code로 매칭 — parseInt 정규화 제거
-      let rawB = BATCHES.find(b =>
-        _normBatch(b.batch) === _bNumPad &&
-        (!_bCode || b.code === _bCode)
-      );
-      if (!rawB) rawB = BATCHES.find(b => b.batch === _bNum && (!_bCode || b.code === _bCode));
-      if (!rawB) return;
-
-      // 1) prodUsedKg 복구 (생산에 사용된 량 되돌리기)
-      rawB.prodUsedKg = Math.max(0, Math.round(((rawB.prodUsedKg||0) - usedKg) * 100) / 100);
-
-      // 2) done(사용완료) 상태 해제
-      // ★ prodUsedKg < weight 이면 아직 전량 생산 안 됨 → done 무조건 해제
-      if (rawB.done) {
-        const totalWeight = rawB.weight || 0;
-        const afterProdUsed = rawB.prodUsedKg; // 이미 위에서 차감된 값
-        if (afterProdUsed < totalWeight - 0.001) {
-          rawB.done   = null;
-          rawB.doneKg = null;
-        }
-        // done 해제 후 분쇄 잔량 있으면 reserved 유지
-        if (!rawB.done) {
-          const grindedKg  = _calcGrindedKg(rawB.batch, rawB.code, rawB.date||rawB.roastDate);
-          const remainProd = Math.max(0, Math.round((grindedKg - rawB.prodUsedKg) * 100) / 100);
-          if (remainProd > 0) rawB.reserved = true;
-        }
-      }
-
-      // 3) 생산계획 없이 직접 생산 입력한 경우: usedKg도 복구
-      const confirmedKg = rawB.usedKg || 0;
-      if (confirmedKg <= 0) {
-        rawB.usedKg   = Math.max(0, Math.round(((rawB.usedKg||0) - usedKg) * 100) / 100);
-        rawB.reserved = false;
-      }
-
-      if (confirmedKg > 0 && !rawB.reserved) {
-        const grindedKg  = _calcGrindedKg(rawB.batch, rawB.code, rawB.date||rawB.roastDate);
-        const remainProd = Math.max(0, Math.round((grindedKg - rawB.prodUsedKg) * 100) / 100);
-        if (remainProd > 0) rawB.reserved = true;
-      }
-    });
-  }
+  // ★ 연결된 배치별 복원 (공통 헬퍼 사용)
+  _restoreBatchEffectsForRecord(rec);
 
   const deletedBatchInputs = rec.batchInputs || {};
   PROD_RECORDS = PROD_RECORDS.filter(r => r.id !== id);
@@ -5508,6 +5652,126 @@ async function deleteProdRecord(id) {
   const _delDetail = '생산 삭제: ' + (rec.itemName||rec.code) + ' ' + (rec.actualQty||rec.qty||0).toLocaleString() + '개 · ' + rec.date + (_delBatches?' · '+_delBatches:'');
   addLog('prod', _delDetail);
   showNotif('prod-notif','success','생산 기록 삭제 완료 · 배치 복원');
+}
+
+// ---- 생산 기록 수정 ----
+function openEditProdRecord(id) {
+  const rec = PROD_RECORDS.find(r => r.id === id);
+  if (!rec) return;
+
+  // ★ 같은 주(월~일) 기록이 아닌 경우 마스터코드 확인 (삭제와 동일 규칙)
+  const thisMonday = _getThisWeekMonday();
+  if (rec.date < thisMonday) {
+    const inputCode = prompt(
+      '⚠ 이전 주의 생산 기록입니다.\n' +
+      '수정하려면 마스터 코드를 입력하세요.\n\n' +
+      '기록일: ' + rec.date + ' · ' + (rec.itemName||rec.code) + ' · ' + (rec.actualQty||rec.qty||0).toLocaleString() + '개'
+    );
+    if (inputCode === null) return;
+    if (inputCode.trim() !== MASTER_CODE) { alert('마스터 코드가 틀렸습니다.'); return; }
+  }
+
+  closeEditProdRecord();
+  const inputKg = rec.inputG ? (rec.inputG/1000) : 0;
+  const html = `
+  <div id="edit-prod-overlay" onclick="if(event.target===this)closeEditProdRecord()" style="position:fixed;inset:0;background:rgba(15,17,23,.75);z-index:9997;display:flex;align-items:center;justify-content:center;padding:24px;">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;width:100%;max-width:420px;overflow:hidden;">
+      <div style="padding:16px 20px;border-bottom:1px solid var(--border);">
+        <div style="font-size:15px;font-weight:700;">생산 기록 수정</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px;">${rec.date} · ${rec.itemName||rec.code} → ${rec.productName||rec.itemName}</div>
+      </div>
+      <div style="padding:18px 20px;display:flex;flex-direction:column;gap:12px;">
+        <label style="font-size:12px;color:var(--text2);">투입KG
+          <input id="edit-p-inputkg" type="number" step="0.01" value="${inputKg}"
+            style="width:100%;margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;color:var(--text);font-size:13px;font-family:'JetBrains Mono',monospace;outline:none;">
+        </label>
+        <label style="font-size:12px;color:var(--text2);">실제수량(개)
+          <input id="edit-p-qty" type="number" value="${rec.actualQty||rec.qty}"
+            style="width:100%;margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;color:var(--text);font-size:13px;font-family:'JetBrains Mono',monospace;outline:none;">
+        </label>
+        <label style="font-size:12px;color:var(--text2);">시간(분)
+          <input id="edit-p-mins" type="number" value="${rec.mins||''}"
+            style="width:100%;margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;color:var(--text);font-size:13px;font-family:'JetBrains Mono',monospace;outline:none;">
+        </label>
+        <label style="font-size:12px;color:var(--text2);">작업자
+          <input id="edit-p-worker" type="text" value="${rec.worker||''}"
+            style="width:100%;margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;color:var(--text);font-size:13px;outline:none;">
+        </label>
+        <div style="font-size:11px;color:var(--text2);">※ 일자·원재료·제품·배치는 수정할 수 없습니다. 변경이 필요하면 삭제 후 다시 입력해주세요.</div>
+      </div>
+      <div style="display:flex;gap:8px;padding:14px 20px;border-top:1px solid var(--border);">
+        <button class="btn btn-ghost btn-sm" style="flex:1;" onclick="closeEditProdRecord()">취소</button>
+        <button class="btn btn-sm" style="flex:1;background:var(--accent);color:#111;font-weight:700;" onclick="saveEditProdRecord(${id})">저장</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+}
+function closeEditProdRecord() {
+  const el = document.getElementById('edit-prod-overlay');
+  if (el) el.remove();
+}
+async function saveEditProdRecord(id) {
+  const rec = PROD_RECORDS.find(r => r.id === id);
+  if (!rec) return;
+
+  const newActualQty = parseInt(document.getElementById('edit-p-qty').value);
+  const newInputKg    = parseFloat(document.getElementById('edit-p-inputkg').value) || 0;
+  const newMins        = parseFloat(document.getElementById('edit-p-mins').value) || 0;
+  const newWorker      = document.getElementById('edit-p-worker').value.trim();
+
+  if (!newActualQty || newActualQty <= 0) { alert('실제 생산수량을 입력해주세요.'); return; }
+
+  const newInputG = Math.round(newInputKg * 1000);
+  const oldBatchInputs = rec.batchInputs || {};
+  const oldTotal = Object.values(oldBatchInputs).reduce((a,v)=>a+v,0);
+
+  // 1) 기존 배치 효과 복원
+  _restoreBatchEffectsForRecord(rec);
+
+  // 2) 새 batchInputs 계산 — 기존 배치 비율 유지하며 새 투입량에 맞춰 스케일
+  let newBatchInputs = {};
+  if (oldTotal > 0 && newInputG > 0) {
+    const ratio = newInputG / oldTotal;
+    Object.entries(oldBatchInputs).forEach(([k,v]) => { newBatchInputs[k] = Math.round(v*ratio*100)/100; });
+  } else {
+    newBatchInputs = oldBatchInputs;
+  }
+
+  // 3) 새 효과 적용
+  _applyBatchEffectsForRecord(newBatchInputs, rec.date, rec.productCode, rec.productName, newActualQty);
+
+  // 4) 레코드 갱신
+  const gram = rec.gramPerUnit || getProduct(rec.productCode)?.gramPerUnit || 0;
+  const expectedQty = gram>0 && newInputG>0 ? Math.floor(newInputG/gram) : null;
+  const lossRate = (newActualQty>0 && expectedQty>0) ? Math.round(((expectedQty-newActualQty)/expectedQty)*1000)/10 : null;
+  const prodKpm  = (newActualQty>0 && newMins>0) ? Math.round(newActualQty/newMins*10)/10 : null;
+  const prodKph  = (newActualQty>0 && newMins>0) ? Math.round(newActualQty/newMins*60) : null;
+
+  rec.qty = newActualQty; rec.actualQty = newActualQty;
+  rec.inputG = newInputG; rec.batchInputs = newBatchInputs;
+  rec.worker = newWorker || '—'; rec.mins = newMins || null;
+  rec.expectedQty = expectedQty; rec.lossRate = lossRate;
+  rec.prodKpm = prodKpm; rec.prodKph = prodKph;
+
+  try {
+    await dbUpdateProdRecord(rec);
+    await Promise.all(Object.keys(newBatchInputs).map(batchKey => {
+      const [_c, _b] = batchKey.includes('||') ? batchKey.split('||') : [null, batchKey];
+      const _bPad = _normBatch(_b);
+      const rawBy = BATCHES.find(b => _normBatch(b.batch)===_bPad && (!_c || b.code===_c) && !b.done)
+        || BATCHES.find(b => _normBatch(b.batch)===_bPad && (!_c || b.code===_c));
+      return rawBy ? dbSaveBatch(rawBy) : Promise.resolve();
+    }));
+  } catch(e) { console.error('saveEditProdRecord DB 오류:', e); }
+
+  closeEditProdRecord();
+  renderProdTable(); renderTodayProdTable(); renderProdStats();
+  if (typeof renderBatchTable === 'function') renderBatchTable();
+  if (typeof renderProdBatchPicker === 'function') renderProdBatchPicker();
+  if (typeof renderGrindBatchPicker === 'function') renderGrindBatchPicker();
+  addLog('prod', '생산 수정: ' + (rec.itemName||rec.code) + ' ' + newActualQty.toLocaleString() + '개 · ' + rec.date);
+  showNotif('prod-notif','success','생산 기록 수정 완료');
 }
 
 function renderProdTable() {
@@ -5560,7 +5824,7 @@ function renderProdTable() {
       <td class="mono" style="font-size:11px;color:var(--text2);">${r.mins||'—'}</td>
       <td class="mono" style="font-size:11px;color:var(--purple);">${r.prodKph?r.prodKph.toLocaleString()+'개/h':'—'}</td>
       <td style="font-size:12px;">${r.worker}</td>
-      <td><button class="btn btn-danger btn-sm" onclick="deleteProdRecord(${r.id})">삭제</button></td>
+      <td style="display:flex;gap:4px;"><button class="btn btn-ghost btn-sm" onclick="openEditProdRecord(${r.id})">수정</button><button class="btn btn-danger btn-sm" onclick="deleteProdRecord(${r.id})">삭제</button></td>
     </tr>`;
   }).join('');
 
