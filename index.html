@@ -746,6 +746,13 @@
             <textarea id="p-loss-reason" rows="2" placeholder="예: 초기 세팅 로스, 포장기 오작동, 원두 분쇄 편차 등"
               style="width:100%;background:var(--bg);border:1px solid rgba(248,113,113,.4);border-radius:6px;padding:8px 10px;color:var(--text);font-size:12px;font-family:inherit;outline:none;resize:vertical;"></textarea>
           </div>
+          <div id="p-speed-reason-wrap" style="display:none;background:rgba(167,139,250,.08);border:1px solid rgba(167,139,250,.3);border-radius:7px;padding:10px 12px;margin-bottom:10px;">
+            <label style="font-size:11px;color:var(--purple);font-weight:600;display:block;margin-bottom:5px;">
+              🐌 생산속도 1,800개/h 미만 — 사유 입력 <span style="color:var(--red);">* 필수</span>
+            </label>
+            <textarea id="p-speed-reason" rows="2" placeholder="예: 머신 워밍업, 잦은 정지, 원두 공급 지연 등"
+              style="width:100%;background:var(--bg);border:1px solid rgba(167,139,250,.4);border-radius:6px;padding:8px 10px;color:var(--text);font-size:12px;font-family:inherit;outline:none;resize:vertical;"></textarea>
+          </div>
           <div class="form-group" style="margin-bottom:10px;">
             <label>일련번호 <span style="font-size:10px;color:var(--red);">* 필수</span></label>
             <input type="text" id="p-serial" placeholder="포장기 일련번호 입력">
@@ -1578,6 +1585,7 @@ function mapGrind(r) {
 function mapProd(r) {
   return { id:r.id, date:r.date, code:r.code, itemName:r.item_name,
     batch:r.batch, qty:r.qty, serialNo:r.serial_no||'', machine:r.machine||'', lossReason:r.loss_reason||'',
+    speedReason:r.speed_reason||'',
     inputG:r.input_g||0, worker:r.worker||'—', batchInputs:r.batch_inputs||{},
     productCode:r.product_code||r.code, productName:r.product_name||r.item_name,
     gramPerUnit:r.gram_per_unit||null, expectedQty:r.expected_qty||null,
@@ -1839,6 +1847,7 @@ async function dbSaveProdRecord(r) {
     id:r.id, date:r.date, code:r.code, item_name:r.itemName, batch:r.batch,
     qty:r.actualQty||r.qty, input_g:r.inputG||0, worker:r.worker||'—', batch_inputs:r.batchInputs||{},
     serial_no:r.serialNo||null, machine:r.machine||null, loss_reason:r.lossReason||null,
+    speed_reason:r.speedReason||null,
     product_code:r.productCode||r.code, product_name:r.productName||r.itemName,
     gram_per_unit:r.gramPerUnit||null, expected_qty:r.expectedQty||null,
     actual_qty:r.actualQty||r.qty, loss_rate:lossRate,
@@ -1853,6 +1862,7 @@ async function dbUpdateProdRecord(r) {
     date:r.date, code:r.code, item_name:r.itemName, batch:r.batch,
     qty:r.actualQty||r.qty, input_g:r.inputG||0, worker:r.worker||'—', batch_inputs:r.batchInputs||{},
     serial_no:r.serialNo||null, machine:r.machine||null, loss_reason:r.lossReason||null,
+    speed_reason:r.speedReason||null,
     product_code:r.productCode||r.code, product_name:r.productName||r.itemName,
     gram_per_unit:r.gramPerUnit||null, expected_qty:r.expectedQty||null,
     actual_qty:r.actualQty||r.qty, loss_rate:lossRate,
@@ -2501,6 +2511,27 @@ function closeLossReasonDetail() {
   const el = document.getElementById('loss-reason-overlay');
   if (el) el.remove();
 }
+function showSpeedReasonDetail(date, batch, reason) {
+  const html = `
+  <div id="speed-reason-overlay" onclick="if(event.target===this)closeSpeedReasonDetail()" style="position:fixed;inset:0;background:rgba(15,17,23,.85);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
+    <div style="background:var(--surface);border:1px solid rgba(167,139,250,.4);border-radius:12px;width:100%;max-width:420px;overflow:hidden;">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border);background:rgba(167,139,250,.08);">
+        <div style="font-size:13px;font-weight:700;color:var(--purple);">🐌 저속 생산 사유</div>
+        <button class="btn btn-ghost btn-sm" onclick="closeSpeedReasonDetail()">닫기</button>
+      </div>
+      <div style="padding:16px 18px;">
+        <div style="font-size:11px;color:var(--text2);margin-bottom:10px;">${date} · 배치 ${batch}</div>
+        <div style="font-size:13px;color:var(--text);line-height:1.6;white-space:pre-wrap;background:var(--surface2);border-radius:8px;padding:12px 14px;">${reason}</div>
+      </div>
+    </div>
+  </div>`;
+  closeSpeedReasonDetail();
+  document.body.insertAdjacentHTML('beforeend', html);
+}
+function closeSpeedReasonDetail() {
+  const el = document.getElementById('speed-reason-overlay');
+  if (el) el.remove();
+}
 
 // ★ 생산분석 탭 — 차트 막대 클릭 시 근거 생산기록 상세 팝업
 function openAnalysisChartDetail(title, records, focus) {
@@ -2515,10 +2546,16 @@ function openAnalysisChartDetail(title, records, focus) {
     const lr = r.lossRate != null ? r.lossRate : (exp>0 && act>0 ? Math.round(((exp-act)/exp)*1000)/10 : null);
     totalExp += exp||0; totalAct += act||0; totalQty += r.qty;
     const lc = lr===null?'var(--text2)':lr<3?'var(--green)':lr<6?'var(--yellow)':'var(--red)';
-    const reasonCell = r.lossReason
-      ? `<span onclick="event.stopPropagation();showLossReasonDetail('${fmt(r.date)}','${(r.batch||'—').replace(/'/g,"\\'")}',\`${r.lossReason.replace(/`/g,"'").replace(/\\/g,'').replace(/"/g,'&quot;').replace(/\n/g,' ')}\`)"
-           style="cursor:pointer;color:var(--red);font-size:11px;text-decoration:underline;text-underline-offset:2px;">📝 사유보기</span>`
-      : '<span style="color:var(--text2);font-size:11px;">—</span>';
+    let reasonCell = '';
+    if (r.lossReason) {
+      reasonCell += `<span onclick="event.stopPropagation();showLossReasonDetail('${fmt(r.date)}','${(r.batch||'—').replace(/'/g,"\\'")}',\`${r.lossReason.replace(/`/g,"'").replace(/\\/g,'').replace(/"/g,'&quot;').replace(/\n/g,' ')}\`)"
+           style="cursor:pointer;color:var(--red);font-size:11px;text-decoration:underline;text-underline-offset:2px;">📝 로스사유</span>`;
+    }
+    if (r.speedReason) {
+      reasonCell += `${reasonCell?'<br>':''}<span onclick="event.stopPropagation();showSpeedReasonDetail('${fmt(r.date)}','${(r.batch||'—').replace(/'/g,"\\'")}',\`${r.speedReason.replace(/`/g,"'").replace(/\\/g,'').replace(/"/g,'&quot;').replace(/\n/g,' ')}\`)"
+           style="cursor:pointer;color:var(--purple);font-size:11px;text-decoration:underline;text-underline-offset:2px;">🐌 속도사유</span>`;
+    }
+    if (!reasonCell) reasonCell = '<span style="color:var(--text2);font-size:11px;">—</span>';
     const batchList = (r.batch||'').split(',').map(s=>s.trim()).filter(Boolean);
     const batchCell = batchList.length <= 1
       ? `<span class="mono" style="font-size:12px;">${batchList[0]||'—'}</span>`
@@ -5324,6 +5361,8 @@ function renderTodayProdTable() {
             onmouseleave="hideBatchTooltip()"
           >#${bNums[0]} 외 ${bNums.length-1}건</span>`;
     const lossReasonMark = r.lossReason ? ` <span style="cursor:help;color:var(--red);" title="사유: ${r.lossReason.replace(/"/g,'&quot;')}">⚠</span>` : '';
+    const speedReasonMark = r.speedReason ? ` <span style="cursor:help;color:var(--purple);" title="저속 사유: ${r.speedReason.replace(/"/g,'&quot;')}">🐌</span>` : '';
+    const speedColor = r.prodKph ? (r.prodKph < 1800 ? 'var(--red)' : 'var(--purple)') : 'var(--text2)';
     return `<tr>
       <td class="mono" style="color:var(--accent);">${sorted.length - i}</td>
       <td class="mono" style="font-size:11px;color:var(--teal);">${r.serialNo||'—'}</td>
@@ -5335,7 +5374,7 @@ function renderTodayProdTable() {
       <td class="mono" style="color:var(--accent);font-weight:600;">${(r.actualQty||r.qty).toLocaleString()}</td>
       <td class="mono" style="color:${lossColor};font-size:11px;">${lossDisplay}${lossReasonMark}</td>
       <td class="mono" style="font-size:11px;color:var(--text2);">${r.mins||'—'}</td>
-      <td class="mono" style="font-size:11px;color:var(--purple);">${r.prodKph ? r.prodKph.toLocaleString()+'개/h' : '—'}</td>
+      <td class="mono" style="font-size:11px;color:${speedColor};">${r.prodKph ? r.prodKph.toLocaleString()+'개/h' : '—'}${speedReasonMark}</td>
       <td style="font-size:12px;">${r.worker}</td>
       <td class="mono" style="font-size:11px;color:var(--text2);">${r.machine||'—'}</td>
       <td style="display:flex;gap:4px;"><button class="btn btn-ghost btn-sm" onclick="openEditProdRecord(${r.id})">수정</button><button class="btn btn-danger btn-sm" onclick="deleteProdRecord(${r.id})">삭제</button></td>
@@ -5650,16 +5689,28 @@ function calcProdPreview() {
   // 생산속도 계산
   const mins = parseFloat(document.getElementById('p-mins')?.value) || 0;
   const speedEl = document.getElementById('p-prev-speed');
+  let currentProdKph = null;
   if (speedEl) {
     if (actualQty > 0 && mins > 0) {
       const perMin  = Math.round(actualQty / mins);
       const perHour = Math.round(actualQty / mins * 60);
+      currentProdKph = perHour;
       speedEl.textContent = perHour.toLocaleString() + '개/h';
       speedEl.title = perMin + '개/분';
+      speedEl.style.color = perHour < 1800 ? 'var(--red)' : 'var(--purple)';
     } else {
       speedEl.textContent = '-';
+      speedEl.style.color = 'var(--purple)';
     }
   }
+  window._currentProdKph = currentProdKph;
+
+  // 생산속도 1,800개/h 미만 시 사유 입력란 표시
+  const speedReasonWrap = document.getElementById('p-speed-reason-wrap');
+  if (speedReasonWrap) {
+    speedReasonWrap.style.display = (currentProdKph !== null && currentProdKph < 1800) ? 'block' : 'none';
+  }
+
   prev.style.display = 'block';
 }
 
@@ -5859,6 +5910,7 @@ async function addProdRecord() {
   const worker     = document.getElementById('p-worker').value.trim();
   const serialNo   = document.getElementById('p-serial')?.value.trim() || '';
   const lossReason = document.getElementById('p-loss-reason')?.value.trim() || '';
+  const speedReason = document.getElementById('p-speed-reason')?.value.trim() || '';
   const prodCode   = document.getElementById('p-product')?.value || '';
   const machineCode = document.getElementById('p-machine')?.value || '';
   // ★ batchIds: 복합키(code||batch)에서 배치번호만 추출
@@ -5874,6 +5926,11 @@ async function addProdRecord() {
   if (window._currentLossRate !== null && window._currentLossRate !== undefined && window._currentLossRate > 6 && !lossReason) {
     showNotif('prod-notif','error','로스율이 6%를 초과했습니다. 사유를 입력해주세요.');
     document.getElementById('p-loss-reason')?.focus();
+    return;
+  }
+  if (window._currentProdKph !== null && window._currentProdKph !== undefined && window._currentProdKph < 1800 && !speedReason) {
+    showNotif('prod-notif','error','생산속도가 1,800개/h 미만입니다. 사유를 입력해주세요.');
+    document.getElementById('p-speed-reason')?.focus();
     return;
   }
 
@@ -5904,6 +5961,7 @@ async function addProdRecord() {
     id: Date.now(), date, code: rawCode, itemName: rawName,
     batch: batchLabel, qty: actualQty, inputG, worker: worker||'—', serialNo, machine: machineCode,
     lossReason: lossReason || null,
+    speedReason: speedReason || null,
     // ★ [수정5] batchInputs key를 code||batch 복합키 그대로 유지 (배치번호만 잘라내지 않음)
     batchInputs: { ..._prodBatchInputs },
     productCode: prodCode, productName, gramPerUnit,
@@ -5966,6 +6024,11 @@ function clearProdForm() {
   const pLossReasonWrap = document.getElementById('p-loss-reason-wrap');
   if (pLossReasonWrap) pLossReasonWrap.style.display = 'none';
   window._currentLossRate = null;
+  const pSpeedReason = document.getElementById('p-speed-reason');
+  if (pSpeedReason) pSpeedReason.value = '';
+  const pSpeedReasonWrap = document.getElementById('p-speed-reason-wrap');
+  if (pSpeedReasonWrap) pSpeedReasonWrap.style.display = 'none';
+  window._currentProdKph = null;
   _prodSelBatch = null;
   _prodBatchInputs = {};
   renderProdBatchPicker();
@@ -6084,6 +6147,10 @@ function openEditProdRecord(id) {
           <textarea id="edit-p-loss-reason" rows="2"
             style="width:100%;margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;color:var(--text);font-size:12px;font-family:inherit;outline:none;resize:vertical;">${rec.lossReason||''}</textarea>
         </label>
+        <label style="font-size:12px;color:var(--text2);">저속 생산 사유 <span style="font-size:10px;color:var(--text2);">(1,800개/h 미만 시 필수)</span>
+          <textarea id="edit-p-speed-reason" rows="2"
+            style="width:100%;margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;color:var(--text);font-size:12px;font-family:inherit;outline:none;resize:vertical;">${rec.speedReason||''}</textarea>
+        </label>
         <div style="font-size:11px;color:var(--text2);">※ 일자·원재료·제품·배치는 수정할 수 없습니다. 변경이 필요하면 삭제 후 다시 입력해주세요.</div>
       </div>
       <div style="display:flex;gap:8px;padding:14px 20px;border-top:1px solid var(--border);">
@@ -6109,6 +6176,7 @@ async function saveEditProdRecord(id) {
   const newSerialNo    = document.getElementById('edit-p-serial')?.value.trim() || '';
   const newMachine     = document.getElementById('edit-p-machine')?.value || '';
   const newLossReason  = document.getElementById('edit-p-loss-reason')?.value.trim() || '';
+  const newSpeedReason = document.getElementById('edit-p-speed-reason')?.value.trim() || '';
 
   if (!newActualQty || newActualQty <= 0) { alert('실제 생산수량을 입력해주세요.'); return; }
 
@@ -6119,6 +6187,12 @@ async function saveEditProdRecord(id) {
   if (_lossRatePre !== null && _lossRatePre > 6 && !newLossReason) {
     alert('로스율이 6%를 초과했습니다. 사유를 입력해주세요.');
     document.getElementById('edit-p-loss-reason')?.focus();
+    return;
+  }
+  const _prodKphPre = (newActualQty>0 && newMins>0) ? Math.round(newActualQty/newMins*60) : null;
+  if (_prodKphPre !== null && _prodKphPre < 1800 && !newSpeedReason) {
+    alert('생산속도가 1,800개/h 미만입니다. 사유를 입력해주세요.');
+    document.getElementById('edit-p-speed-reason')?.focus();
     return;
   }
 
@@ -6152,6 +6226,7 @@ async function saveEditProdRecord(id) {
   rec.inputG = newInputG; rec.batchInputs = newBatchInputs;
   rec.worker = newWorker || '—'; rec.mins = newMins || null;
   rec.serialNo = newSerialNo; rec.machine = newMachine; rec.lossReason = newLossReason || null;
+  rec.speedReason = newSpeedReason || null;
   rec.expectedQty = expectedQty; rec.lossRate = lossRate;
   rec.prodKpm = prodKpm; rec.prodKph = prodKph;
 
@@ -8397,7 +8472,7 @@ function exportProdExcel() {
   if (!list.length) { alert('다운로드할 생산 기록이 없습니다.'); return; }
 
   const sorted = [...list].sort((a,b) => b.date.localeCompare(a.date));
-  const header = ['순번','생산일자','일련번호','원재료코드','원재료명','생산제품','배치번호','투입량(kg)','예상수량(개)','실제수량(개)','로스율(%)','소요시간(분)','생산속도(개/h)','작업자'];
+  const header = ['순번','생산일자','일련번호','원재료코드','원재료명','생산제품','배치번호','투입량(kg)','예상수량(개)','실제수량(개)','로스율(%)','소요시간(분)','생산속도(개/h)','작업자','로스사유','저속사유'];
   const rows = sorted.map((r, i) => {
     const inputKg = r.inputG > 0 ? Math.round(r.inputG/10)/100 : '';
     const actQty  = r.actualQty || r.qty;
@@ -8418,7 +8493,9 @@ function exportProdExcel() {
       lossRate,
       r.mins || '',
       r.prodKph || '',
-      r.worker || ''
+      r.worker || '',
+      r.lossReason || '',
+      r.speedReason || ''
     ];
   });
 
