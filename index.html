@@ -763,7 +763,7 @@
           </div>
           <div class="btn-row">
             <button class="btn btn-ghost" onclick="clearProdForm()">초기화</button>
-            <button class="btn btn-primary" onclick="addProdRecord()">생산 완료</button>
+            <button class="btn btn-primary" id="prod-add-btn" onclick="addProdRecord()">생산 완료</button>
           </div>
         </div>
       </div>
@@ -967,7 +967,7 @@
           </div>
           <div class="btn-row">
             <button class="btn btn-ghost" onclick="clearGrindForm()">초기화</button>
-            <button class="btn btn-primary" onclick="addGrindRecord()">분쇄 완료</button>
+            <button class="btn btn-primary" id="grind-add-btn" onclick="addGrindRecord()">분쇄 완료</button>
           </div>
         </div>
       </div>
@@ -5901,7 +5901,9 @@ function _applyBatchEffectsForRecord(batchInputs, date, prodCode, productName, a
   });
 }
 
+let _prodAddInProgress = false; // ★ 중복 클릭(연타)으로 인한 생산기록 중복 저장 방지
 async function addProdRecord() {
+  if (_prodAddInProgress) return; // 이미 처리 중이면 무시
   const date       = document.getElementById('p-date').value;
   let   rawCode    = document.getElementById('p-item').value;
   const actualQty  = parseInt(document.getElementById('p-qty').value);
@@ -5934,6 +5936,11 @@ async function addProdRecord() {
     return;
   }
 
+
+  // ★ 여기까지 유효성 검사 통과 → 락 설정 (중복 클릭 방지)
+  _prodAddInProgress = true;
+  const _prodBtn = document.getElementById('prod-add-btn');
+  if (_prodBtn) { _prodBtn.disabled = true; _prodBtn.style.opacity = '.6'; _prodBtn.style.pointerEvents = 'none'; }
 
   // ★ [수정3] 원재료코드/이름 결정 — batchIds[0]은 code||batch 복합키이므로 파싱 후 find
   let rawName = '미지정';
@@ -5988,6 +5995,10 @@ async function addProdRecord() {
       return rawBx ? dbSaveBatch(rawBx) : Promise.resolve();
     }));
   } catch(e) { console.error('addProdRecord DB 저장 실패:', e); }
+  finally {
+    _prodAddInProgress = false;
+    if (_prodBtn) { _prodBtn.disabled = false; _prodBtn.style.opacity = ''; _prodBtn.style.pointerEvents = ''; }
+  }
   renderBatchTable();
   populateProdItemSelect();
 
@@ -7287,7 +7298,9 @@ function calcGrindPreview() {
   prev.style.display = 'block';
 }
 
+let _grindAddInProgress = false; // ★ 중복 클릭(연타)으로 인한 분쇄기록 중복 저장 방지
 async function addGrindRecord() {
+  if (_grindAddInProgress) return; // 이미 처리 중이면 무시
   let code  = document.getElementById('g-item').value;
   const kg    = parseFloat(document.getElementById('g-kg').value);
   const mins  = parseFloat(document.getElementById('g-mins').value);
@@ -7296,6 +7309,9 @@ async function addGrindRecord() {
   if (!recDate) { showNotif('grind-notif','error','분쇄 날짜를 선택해주세요.'); return; }
   if (!kg||kg<=0)   { showNotif('grind-notif','error','분쇄 중량을 입력해주세요.'); return; }
   if (!mins||mins<=0){ showNotif('grind-notif','error','소요시간을 입력해주세요.'); return; }
+  _grindAddInProgress = true;
+  const _btn = document.getElementById('grind-add-btn');
+  if (_btn) { _btn.disabled = true; _btn.style.opacity = '.6'; _btn.style.pointerEvents = 'none'; }
   const kpm = Math.round(kg/mins*100)/100;
   const kph = Math.round(kg/mins*60*10)/10;
 
@@ -7370,6 +7386,10 @@ async function addGrindRecord() {
       return rawB2 ? dbSaveBatch(rawB2) : Promise.resolve();
     }));
   } catch(e) { console.error('grindRecord DB 저장 실패:', e); }
+  finally {
+    _grindAddInProgress = false;
+    if (_btn) { _btn.disabled = false; _btn.style.opacity = ''; _btn.style.pointerEvents = ''; }
+  }
   // 알림용 요약 (itemName 재할당)
   itemName = newGrinds.map(g => g.itemName).join(', ');
   clearGrindForm();
@@ -7878,7 +7898,9 @@ async function reconcileGrindUsedKg() {
     const bkgs = r.batchKgs || {};
     if (Object.keys(bkgs).length > 0) {
       // batchKgs 있으면 배치별 정확한 값 사용
-      Object.entries(bkgs).forEach(([bn, kg]) => {
+      // ★ key 형식이 "code||batch" 복합키이므로 배치번호만 추출해서 매칭 (버그 수정)
+      Object.entries(bkgs).forEach(([ck, kg]) => {
+        const bn = ck.includes('||') ? ck.split('||')[1] : ck;
         realGrindMap[bn] = Math.round(((realGrindMap[bn]||0) + (parseFloat(kg)||0)) * 100) / 100;
       });
     } else if (r.batches && r.batches.length > 0) {
@@ -7893,7 +7915,7 @@ async function reconcileGrindUsedKg() {
   // 불일치 배치 찾아서 보정
   const toFix = [];
   BATCHES.forEach(b => {
-    const real = realGrindMap[b.batch] || 0;
+    const real = realGrindMap[_normBatch(b.batch)] || 0;
     const stored = b.grindUsedKg || 0;
     if (Math.abs(real - stored) > 0.001) {
       console.warn(`[보정] 배치 ${b.batch}: grindUsedKg ${stored} → ${real} (실제 분쇄기록 기준)`);
